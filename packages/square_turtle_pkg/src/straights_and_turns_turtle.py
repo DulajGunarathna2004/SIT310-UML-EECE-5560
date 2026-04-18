@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
 import rospy
+import math
 from geometry_msgs.msg import Twist, Point
 from std_msgs.msg import Float64
 from turtlesim.msg import Pose
-import math
+
 
 class StraightAndTurnController:
     def __init__(self):
@@ -21,17 +22,21 @@ class StraightAndTurnController:
         self.pose = None
         self.total_distance = 0.0
 
-        self.goal_distance = None
-        self.goal_angle = None
+        self.goal_distance = 0.0
+        self.goal_angle = 0.0
         self.goal_position = None
 
-        self.start_distance = None
-        self.start_theta = None
+        self.start_distance = 0.0
+        self.start_theta = 0.0
 
-        self.moving_straight = False
-        self.turning = False
-        self.moving_to_position = False
-        self.position_stage = None   # "turn" or "move"
+        self.mode = "idle"          
+
+        self.linear_speed = 1.0
+        self.angular_speed = 1.0
+
+        self.distance_tolerance = 0.05
+        self.angle_tolerance = 0.05
+        self.position_tolerance = 0.10
 
         self.timer = rospy.Timer(rospy.Duration(0.1), self.control_loop)
 
@@ -42,118 +47,149 @@ class StraightAndTurnController:
         self.total_distance = msg.data
 
     def goal_distance_callback(self, msg):
+        self.stop_all_goals()
+
         self.goal_distance = msg.data
         self.start_distance = self.total_distance
-        self.moving_straight = True
-        self.turning = False
-        self.moving_to_position = False
 
-        if self.goal_distance == 0:
-            self.moving_straight = False
+        if abs(self.goal_distance) < 1e-6:
             rospy.loginfo("Goal distance is 0, turtle will not move.")
-        else:
-            rospy.loginfo("Received goal distance: %f", self.goal_distance)
+            return
+
+        self.mode = "distance"
+        rospy.loginfo("Received goal distance: %.2f", self.goal_distance)
 
     def goal_angle_callback(self, msg):
-        if self.pose is not None:
-            self.goal_angle = msg.data   # input in radians
-            self.start_theta = self.pose.theta
-            self.turning = True
-            self.moving_straight = False
-            self.moving_to_position = False
+        if self.pose is None:
+            rospy.logwarn("Pose not received yet.")
+            return
 
-            if self.goal_angle == 0:
-                self.turning = False
-                rospy.loginfo("Goal angle is 0, turtle will not rotate.")
-            else:
-                rospy.loginfo("Received goal angle: %f radians", self.goal_angle)
+        self.stop_all_goals()
+
+        self.goal_angle = msg.data
+        self.start_theta = self.pose.theta
+
+        if abs(self.goal_angle) < 1e-6:
+            rospy.loginfo("Goal angle is 0, turtle will not rotate.")
+            return
+
+        self.mode = "angle"
+        rospy.loginfo("Received goal angle: %.2f", self.goal_angle)
 
     def goal_position_callback(self, msg):
-        if self.pose is not None:
-            self.goal_position = msg
-            self.moving_to_position = True
-            self.moving_straight = False
-            self.turning = False
-            self.position_stage = "turn"
-            rospy.loginfo("Received goal position: x=%f, y=%f", msg.x, msg.y)
+        if self.pose is None:
+            rospy.logwarn("Pose not received yet.")
+            return
 
-    def angle_difference(self, a, b):
-        diff = a - b
-        while diff > math.pi:
-            diff -= 2 * math.pi
-        while diff < -math.pi:
-            diff += 2 * math.pi
-        return diff
+        self.stop_all_goals()
+
+        self.goal_position = msg
+        self.mode = "position_turn"
+        rospy.loginfo("Received goal position: x=%.2f, y=%.2f", msg.x, msg.y)
+
+    def stop_all_goals(self):
+        self.goal_distance = 0.0
+        self.goal_angle = 0.0
+        self.goal_position = None
+        self.mode = "idle"
+        self.publish_stop()
+
+    def publish_stop(self):
+        cmd = Twist()
+        cmd.linear.x = 0.0
+        cmd.angular.z = 0.0
+        self.cmd_pub.publish(cmd)
+
+    def normalize_angle(self, angle):
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        while angle < -math.pi:
+            angle += 2 * math.pi
+        return angle
 
     def control_loop(self, event):
+        if self.pose is None:
+            return
+
         cmd = Twist()
 
-        if self.moving_straight and self.goal_distance is not None:
-            travelled = self.total_distance - self.start_distance
+        # DISTANCE MODE
+        if self.mode == "distance":
+            travelled = abs(self.total_distance - self.start_distance)
+            target = abs(self.goal_distance)
 
-            if abs(travelled) < abs(self.goal_distance):
-                if self.goal_distance > 0:
-                    cmd.linear.x = 1.0
-                else:
-                    cmd.linear.x = -1.0
-                cmd.angular.z = 0.0
-            else:
-                cmd.linear.x = 0.0
-                cmd.angular.z = 0.0
-                self.moving_straight = False
+            if travelled >= target - self.distance_tolerance:
+                self.publish_stop()
+                self.mode = "idle"
                 rospy.loginfo("Reached goal distance")
+                return
 
-        elif self.turning and self.goal_angle is not None and self.pose is not None:
-            turned = self.angle_difference(self.pose.theta, self.start_theta)
-
-            if abs(turned) < abs(self.goal_angle):
-                cmd.linear.x = 0.0
-                if self.goal_angle > 0:
-                    cmd.angular.z = 1.0      # counter-clockwise
-                else:
-                    cmd.angular.z = -1.0     # clockwise
+            if self.goal_distance > 0:
+                cmd.linear.x = self.linear_speed
             else:
-                cmd.linear.x = 0.0
-                cmd.angular.z = 0.0
-                self.turning = False
-                rospy.loginfo("Reached goal angle")
+                cmd.linear.x = -self.linear_speed
 
-        elif self.moving_to_position and self.goal_position is not None and self.pose is not None:
+            cmd.angular.z = 0.0
+
+        # ANGLE MODE
+        elif self.mode == "angle":
+            turned = abs(self.normalize_angle(self.pose.theta - self.start_theta))
+            target = abs(self.goal_angle)
+
+            if turned >= target - self.angle_tolerance:
+                self.publish_stop()
+                self.mode = "idle"
+                rospy.loginfo("Reached goal angle")
+                return
+
+            cmd.linear.x = 0.0
+            if self.goal_angle > 0:
+                cmd.angular.z = self.angular_speed      # counter-clockwise
+            else:
+                cmd.angular.z = -self.angular_speed     # clockwise
+
+        # POSITION MODE - TURN FIRST
+        elif self.mode == "position_turn":
             dx = self.goal_position.x - self.pose.x
             dy = self.goal_position.y - self.pose.y
 
             target_angle = math.atan2(dy, dx)
-            angle_error = self.angle_difference(target_angle, self.pose.theta)
+            angle_error = self.normalize_angle(target_angle - self.pose.theta)
+
+            if abs(angle_error) <= self.angle_tolerance:
+                self.publish_stop()
+                self.mode = "position_move"
+                rospy.loginfo("Finished turning toward position")
+                return
+
+            cmd.linear.x = 0.0
+            if angle_error > 0:
+                cmd.angular.z = self.angular_speed
+            else:
+                cmd.angular.z = -self.angular_speed
+
+        # POSITION MODE - THEN MOVE STRAIGHT
+        elif self.mode == "position_move":
+            dx = self.goal_position.x - self.pose.x
+            dy = self.goal_position.y - self.pose.y
             distance_error = math.sqrt(dx * dx + dy * dy)
 
-            if self.position_stage == "turn":
-                if abs(angle_error) > 0.05:
-                    cmd.linear.x = 0.0
-                    if angle_error > 0:
-                        cmd.angular.z = 1.0
-                    else:
-                        cmd.angular.z = -1.0
-                else:
-                    cmd.linear.x = 0.0
-                    cmd.angular.z = 0.0
-                    self.position_stage = "move"
+            if distance_error <= self.position_tolerance:
+                self.publish_stop()
+                self.mode = "idle"
+                rospy.loginfo("Reached goal position")
+                return
 
-            elif self.position_stage == "move":
-                if distance_error > 0.1:
-                    cmd.linear.x = 1.0
-                    cmd.angular.z = 0.0
-                else:
-                    cmd.linear.x = 0.0
-                    cmd.angular.z = 0.0
-                    self.moving_to_position = False
-                    self.position_stage = None
-                    rospy.loginfo("Reached goal position")
+            cmd.linear.x = self.linear_speed
+            cmd.angular.z = 0.0
 
+        # IDLE
         else:
             cmd.linear.x = 0.0
             cmd.angular.z = 0.0
 
         self.cmd_pub.publish(cmd)
+
 
 if __name__ == '__main__':
     try:
